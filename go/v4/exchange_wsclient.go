@@ -133,9 +133,11 @@ func (this *WSClient) handleMessages() {
 			this.OnPing()
 			// Respond with pong
 			if this.Verbose {
-				this.Log(time.Now(), "sending connection ping")
+				this.Log(time.Now(), "sending connection pong")
 			}
+			this.ConnectionMu.Lock()
 			this.Connection.WriteMessage(websocket.PongMessage, nil)
+			this.ConnectionMu.Unlock()
 		case websocket.PongMessage:
 			this.OnPong()
 		case websocket.CloseMessage:
@@ -211,58 +213,73 @@ func (this *WSClient) ClearPingInterval() {
 
 func (this *WSClient) OnPingInterval() {
 	this.PingMu.Lock()
-	if this.KeepAlive.(int64) > 0 {
-		if this.IsConnected.(bool) == true {
-			now := time.Now().UnixNano() / int64(time.Millisecond)
-			lastPong := this.GetLastPong()
-			if lastPong == nil {
-				lastPong = now
-				this.SetLastPong(lastPong)
-			}
-			lastPongVal := lastPong.(int64)
-			maxPingPongMisses := float64(2.0)
-			if this.MaxPingPongMisses != nil {
-				if misses, ok := this.MaxPingPongMisses.(float64); ok {
-					maxPingPongMisses = misses
-				}
-			}
-			if (lastPongVal + this.KeepAlive.(int64)*int64(maxPingPongMisses)) < now {
-				err := RequestTimeout("Connection to " + this.Url + " timed out due to a ping-pong keepalive missing on time")
-				this.OnError(err)
-			} else {
-				var message interface{}
-				if this.Ping != nil {
-					if pingFunc, ok := this.Ping.(func(*WSClient) interface{}); ok {
-						message = pingFunc(this)
-					}
-					if pingFunc, ok := this.Ping.(func(interface{}) interface{}); ok { // todo: type Ping() function properly inside derived files
-						message = pingFunc(this)
-					}
-				}
-				if message != nil {
-					go func() {
-						future := this.Send(message)
-						if err := <-future; err != nil {
-							if b, ok := err.(bool); ok && b {
-								return // not an error?
-							}
-							this.OnError(err)
-						}
-					}()
-				} else {
-					// In Go, we can ping directly on websocket connection
-					if this.Connection != nil {
-						// this.Connection.WriteMessage(websocket.PingMessage, []byte{})
-						if this.Verbose {
-							this.Log(time.Now(), "sending connection ping")
-						}
-						this.Connection.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
-					}
-				}
-			}
+	keepAlive, _ := this.KeepAlive.(int64)
+	if keepAlive <= 0 {
+		this.PingMu.Unlock()
+		return
+	}
+	isConn, _ := this.IsConnected.(bool)
+	if !isConn {
+		this.PingMu.Unlock()
+		return
+	}
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+	lastPong := this.GetLastPong()
+	if lastPong == nil {
+		lastPong = now
+		this.SetLastPong(lastPong)
+	}
+	lastPongVal := lastPong.(int64)
+	maxPingPongMisses := float64(2.0)
+	if this.MaxPingPongMisses != nil {
+		if misses, ok := this.MaxPingPongMisses.(float64); ok {
+			maxPingPongMisses = misses
+		}
+	}
+	timedOut := (lastPongVal + keepAlive*int64(maxPingPongMisses)) < now
+
+	// Build the ping message while holding PingMu, but release PingMu
+	// before any write to avoid lock-ordering deadlocks with ConnectionMu.
+	var message interface{}
+	if !timedOut && this.Ping != nil {
+		if pingFunc, ok := this.Ping.(func(*WSClient) interface{}); ok {
+			message = pingFunc(this)
+		}
+		if pingFunc, ok := this.Ping.(func(interface{}) interface{}); ok {
+			message = pingFunc(this)
 		}
 	}
 	this.PingMu.Unlock()
+
+	if timedOut {
+		err := RequestTimeout("Connection to " + this.Url + " timed out due to a ping-pong keepalive missing on time")
+		this.OnError(err)
+		return
+	}
+
+	if message != nil {
+		// Send application-level ping (e.g. Bybit {"op":"ping"}).
+		// Send() acquires ConnectionMu internally, so we must NOT hold PingMu here.
+		go func() {
+			future := this.Send(message)
+			if err := <-future; err != nil {
+				if b, ok := err.(bool); ok && b {
+					return
+				}
+				this.OnError(err)
+			}
+		}()
+	} else {
+		// Protocol-level WebSocket ping frame.
+		this.ConnectionMu.Lock()
+		if this.Connection != nil {
+			if this.Verbose {
+				this.Log(time.Now(), "sending connection ping")
+			}
+			this.Connection.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+		}
+		this.ConnectionMu.Unlock()
+	}
 }
 
 func (this *WSClient) OnOpen() {
