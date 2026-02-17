@@ -210,9 +210,10 @@ func (f *Future) Reject(reason interface{}) {
 
 func (f *Future) Await() <-chan interface{} {
 	ch := make(chan interface{}, 1)
+	// We must atomically check resolved AND register as subscriber.
+	// Resolve() holds mu then subscribersMu, so we use the same order here.
 	f.mu.Lock()
 	if f.resolved {
-		// Already resolved, return cached value immediately
 		if f.resolvedError != nil {
 			ch <- f.resolvedError
 		} else {
@@ -221,38 +222,15 @@ func (f *Future) Await() <-chan interface{} {
 		f.mu.Unlock()
 		return ch
 	}
-	f.mu.Unlock()
+	// Still holding mu — Resolve cannot proceed past its mu.Lock() until
+	// we release it, so subscribing here is safe from the race.
 	f.subscribersMu.Lock()
 	if f.subscribers == nil {
 		f.subscribers = make([]chan interface{}, 0)
 	}
 	f.subscribers = append(f.subscribers, ch)
 	f.subscribersMu.Unlock()
-	// go func() {
-	// 	defer close(ch)
-	// 	// f.mu.Lock()
-	// 	if f.resolved {
-	// 		// Already resolved, return cached value immediately
-	// 		if f.resolvedError != nil {
-	// 			ch <- f.resolvedError
-	// 		} else {
-	// 			ch <- f.resolvedValue
-	// 		}
-	// 		// f.mu.Unlock()
-	// 		return
-	// 	}
-
-	// 	// f.mu.Unlock()
-
-	// 	// Not resolved yet, wait for it
-	// 	select {
-	// 	case res := <-f.result:
-	// 		ch <- res
-	// 	case err := <-f.err:
-	// 		ch <- err
-	// 	}
-	// }()
-
+	f.mu.Unlock()
 	return ch
 }
 
